@@ -1,5 +1,5 @@
 """
-7주차 1번 수업: 탭 구조 복원 및 전체 기능 통합 대시보드
+7주차 1번 수업: 데이터 업로드 탭 추가 및 전체 기능 통합 대시보드
 """
 import sqlite3
 
@@ -27,20 +27,58 @@ AI_NOTES = {
 AI_SOURCE = "출력된 해설은 주별 플랫폼 유입경로 퍼널 데이터를 기반으로 작성되었습니다."
 
 # ------------------------------------------------------------
-# 0. 필요한 데이터만 추출 — 쓸 테이블과 컬럼만 메모리 DB에 올리고, 정제 테이블 events를 처음 한 번만 만듦
+# 업로드 파일 확인 및 컬럼 검증 (캐시 함수 밖에서 수행)
 # ------------------------------------------------------------
-DATA_DIR = "data"                         # 원본 CSV를 넣어 둔 폴더
-NEEDED = {                                 # 이번 대시보드에 필요한 테이블과 컬럼
-    "app_events": ["event_id", "event_datetime", "customer_id", "session_id",
-                   "event_name", "platform", "traffic_source"],
+uploaded_file = st.session_state.get("upload_file")
+required_cols = ["event_id", "event_datetime", "customer_id", "session_id", "event_name", "platform", "traffic_source"]
+
+file_bytes = None
+data_source_label = "data 폴더 기본 파일"
+
+if uploaded_file is not None:
+    try:
+        # 임시로 읽어서 컬럼 검증
+        temp_df = pd.read_csv(uploaded_file, nrows=5)
+        missing_cols = [col for col in required_cols if col not in temp_df.columns]
+        
+        if missing_cols:
+            st.error(f"업로드한 파일에 필수 컬럼이 빠져 있습니다: {', '.join(missing_cols)}. data 폴더 기본 파일을 사용합니다.")
+            uploaded_file = None
+        else:
+            uploaded_file.seek(0)
+            file_bytes = uploaded_file.getvalue()
+            data_source_label = f"올린 파일 {uploaded_file.name}"
+    except Exception as e:
+        st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}. data 폴더 기본 파일을 사용합니다.")
+        uploaded_file = None
+
+# 업로드 파일 변경 감지 및 필터 초기화 번호 관리
+if "last_uploaded_file_name" not in st.session_state:
+    st.session_state["last_uploaded_file_name"] = None
+
+current_file_name = uploaded_file.name if uploaded_file is not None else None
+if current_file_name != st.session_state["last_uploaded_file_name"]:
+    if "filter_version" in st.session_state:
+        st.session_state["filter_version"] += 1
+    st.session_state["last_uploaded_file_name"] = current_file_name
+
+# ------------------------------------------------------------
+# 0. 필요한 데이터만 추출 — 캐시 함수 (밑줄(_) 인자 사용 금지)
+# ------------------------------------------------------------
+DATA_DIR = "data"
+NEEDED = {
+    "app_events": required_cols,
 }
 
 @st.cache_resource
-def get_db():                              # 필요한 컬럼만 메모리 DB에 올리고, 정제 테이블 events를 만듦 (처음 한 번만)
+def get_db(f_bytes):
     con = sqlite3.connect(":memory:", check_same_thread=False)
-    for name, cols in NEEDED.items():
-        pd.read_csv(f"{DATA_DIR}/{name}.csv", usecols=cols).to_sql(name, con, index=False)
-    # 5주차 제외 규칙: QA 계정 제외 · 중복 이벤트 제거
+    if f_bytes is not None:
+        import io
+        pd.read_csv(io.BytesIO(f_bytes), usecols=NEEDED["app_events"]).to_sql("app_events", con, index=False)
+    else:
+        pd.read_csv(f"{DATA_DIR}/app_events.csv", usecols=NEEDED["app_events"]).to_sql("app_events", con, index=False)
+        
     con.execute("""
         CREATE TABLE events AS
         SELECT event_id, event_datetime, customer_id, session_id, event_name, platform, traffic_source
@@ -51,20 +89,15 @@ def get_db():                              # 필요한 컬럼만 메모리 DB에
                  WHERE customer_id NOT LIKE 'QA%')
          WHERE dup = 1
     """)
-    # 세션별로 묶는 집계가 빨라지도록 session_id에 인덱스를 붙임 (없으면 첫 실행이 몇 분 걸릴 수 있음)
     con.execute("CREATE INDEX idx_events_session ON events(session_id)")
     return con
 
-# ------------------------------------------------------------
-# 1. 데이터 준비 — 정제된 events 테이블을 SQL로 집계
-# ------------------------------------------------------------
 @st.cache_data
-def query(sql):                            # SQL을 실행해 표로 돌려줌
-    return pd.read_sql(sql, get_db())
+def query(sql, f_bytes):
+    return pd.read_sql(sql, get_db(f_bytes))
 
-# 주 × 플랫폼 × 유입 경로별 세션 퍼널
 SQL_WEEKLY_FUNNEL = """
-WITH s AS (                                 -- 세션의 첫 이벤트로 플랫폼 · 유입 경로 · 주 정하기
+WITH s AS (
     SELECT session_id, platform, traffic_source,
            DATE(MIN(event_datetime), 'weekday 0', '-6 days') AS 주시작일
       FROM events
@@ -81,21 +114,21 @@ SELECT s.주시작일,
        SUM(CASE WHEN e.event_name = 'payment_fail' THEN 1 ELSE 0 END)                       AS 결제실패
   FROM events e
   JOIN s ON e.session_id = s.session_id
- WHERE s.주시작일 < '2026-06-29'            -- 이틀치뿐인 마지막 주 제외
+ WHERE s.주시작일 < '2026-06-29'
  GROUP BY 1, 2, 3
  ORDER BY 1, 2, 3
 """
 
 @st.cache_data
-def load_data():
-    data = query(SQL_WEEKLY_FUNNEL)
+def load_data(f_bytes):
+    data = query(SQL_WEEKLY_FUNNEL, f_bytes)
     data["주시작일"] = pd.to_datetime(data["주시작일"]).dt.date
     return data
 
-df = load_data()                           # 주 × 플랫폼 × 유입 경로별 세션 퍼널
+df = load_data(file_bytes)
 
 # ------------------------------------------------------------
-# 사이드바 필터 설정 (필터 초기화 번호 적용)
+# 사이드바 필터 설정
 # ------------------------------------------------------------
 st.sidebar.header("필터")
 
@@ -108,15 +141,15 @@ if st.sidebar.button("필터 초기화"):
     st.session_state["filter_version"] += 1
     st.rerun()
 
-dates = sorted(df["주시작일"].unique())
+dates = sorted(df["주시작일"].unique()) if not df.empty else []
 selected_dates = st.sidebar.select_slider(
     "기간",
     options=dates,
-    value=(dates[0], dates[-1]),
+    value=(dates[0], dates[-1]) if dates else (None, None),
     key=f"period_{v}"
 )
 
-platforms = sorted(df["플랫폼"].unique())
+platforms = sorted(df["플랫폼"].unique()) if not df.empty else []
 selected_platforms = st.sidebar.multiselect(
     "플랫폼",
     options=platforms,
@@ -124,7 +157,7 @@ selected_platforms = st.sidebar.multiselect(
     key=f"platforms_{v}"
 )
 
-traffic_sources = sorted(df["유입경로"].unique())
+traffic_sources = sorted(df["유입경로"].unique()) if not df.empty else []
 selected_traffic_sources = st.sidebar.multiselect(
     "유입 경로",
     options=traffic_sources,
@@ -132,13 +165,12 @@ selected_traffic_sources = st.sidebar.multiselect(
     key=f"traffic_sources_{v}"
 )
 
-# 고급 설정 (평소 범위 기준 기간 + 세션 500개 미만 집단 제외 체크박스)
-default_end_idx = min(25, len(dates) - 1)
+default_end_idx = min(25, len(dates) - 1) if dates else 0
 with st.sidebar.expander("고급 설정"):
     baseline_dates = st.select_slider(
         "평소 범위 기준 기간",
         options=dates,
-        value=(dates[0], dates[default_end_idx]),
+        value=(dates[0], dates[default_end_idx]) if dates else (None, None),
         help="문제가 없던 기간을 고르세요. 이 기간의 주별 값 범위를 '평소 범위'로 씁니다.",
         key=f"baseline_{v}"
     )
@@ -148,17 +180,15 @@ with st.sidebar.expander("고급 설정"):
         key=f"exclude_low_{v}"
     )
 
-# 집단 조건(플랫폼·유입경로)만 적용한 데이터 g 생성
 g = df[
     (df["플랫폼"].isin(selected_platforms)) &
     (df["유입경로"].isin(selected_traffic_sources))
-]
+] if not df.empty else df
 
-# 기존 f는 g에 기간 조건까지 더해 만듦
 f = g[
     (g["주시작일"] >= selected_dates[0]) &
     (g["주시작일"] <= selected_dates[1])
-]
+] if not df.empty and selected_dates[0] is not None else g
 
 # ------------------------------------------------------------
 # 사이드바 맨 아래 다운로드 버튼 추가
@@ -185,17 +215,14 @@ with dl_col2:
         width="stretch"
     )
 
-# f가 비어 있으면 경고 표시 후 중단
-if f.empty:
-    st.warning("선택한 조건에 해당하는 데이터가 없습니다. 필터를 바꿔 주세요.")
-    st.stop()
-
 # ------------------------------------------------------------
-# 보고 있는 조건 표시 st.caption 추가
+# 보고 있는 조건 표시 st.caption 추가 (데이터 정보 포함)
 # ------------------------------------------------------------
 all_dates_set = set(dates)
-f_dates_set = set(sorted(f["주시작일"].unique()))
-if f_dates_set == all_dates_set or (selected_dates[0] == dates[0] and selected_dates[1] == dates[-1]):
+f_dates_set = set(sorted(f["주시작일"].unique())) if not f.empty else set()
+if not dates:
+    period_str = "선택 없음"
+elif f_dates_set == all_dates_set or (selected_dates[0] == dates[0] and selected_dates[1] == dates[-1]):
     period_str = "전체"
 elif not selected_dates:
     period_str = "선택 없음"
@@ -216,19 +243,26 @@ elif len(selected_traffic_sources) == len(traffic_sources):
 else:
     traffic_str = ", ".join(selected_traffic_sources)
 
-st.caption(f"🔎 보고 있는 조건: 기간 ({period_str}) · 플랫폼 ({platform_str}) · 유입 경로 ({traffic_str})")
+st.caption(f"🔎 보고 있는 조건: 데이터 ({data_source_label}) · 기간 ({period_str}) · 플랫폼 ({platform_str}) · 유입 경로 ({traffic_str})")
 
 # ------------------------------------------------------------
-# 탭 구성 (개요, 탐색, 액션)
+# 탭 구성 (개요, 탐색, 액션, 데이터 업로드)
 # ------------------------------------------------------------
-tab_overview, tab_explore, tab_action = st.tabs(["📊 개요", "🔍 탐색", "✅ 액션"])
+tab_overview, tab_explore, tab_action, tab_upload = st.tabs(["📊 개요", "🔍 탐색", "✅ 액션", "📤 데이터 업로드"])
+
+with tab_upload:
+    st.caption("이 탭에서 볼 수 있는 것: 사용자 정의 CSV 데이터 업로드 기능")
+    st.file_uploader("app_events.csv 올리기", type="csv", key="upload_file")
+    st.caption("업로드된 파일은 서버나 저장소에 저장되지 않으며, 대시보드 시각화 용도로만 메모리상에서 사용됩니다.")
+
+# f가 비어 있으면 경고 표시 후 중단 (업로드 탭은 정상적으로 그려지도록 하단에 배치)
+if f.empty:
+    st.warning("선택한 조건에 해당하는 데이터가 없습니다. 필터를 바꿔 주세요.")
+    st.stop()
 
 with tab_overview:
     st.caption("이 탭에서 볼 수 있는 것: KPI 카드, 규칙 기반 숫자 해설, 전체 AI 해설, 주별 결제 전환율, 세션 퍼널, 유입 경로별 주문 전환율")
 
-    # ------------------------------------------------------------
-    # 2. KPI 카드
-    # ------------------------------------------------------------
     def rate(a, b):
         return a / b * 100 if b else 0
 
@@ -238,14 +272,11 @@ with tab_overview:
     c2.metric("주문 전환율 (방문 → 주문)", f"{rate(t['주문세션'], t['세션수']):.1f}%")
     c3.metric("결제 전환율 (결제 시작 → 주문)", f"{rate(t['주문세션'], t['결제시작세션']):.1f}%")
 
-    # ------------------------------------------------------------
-    # 규칙 기반 설명 문장 및 AI 해설 통합 컨테이너
-    # ------------------------------------------------------------
     with st.container(border=True):
         st.markdown("**📏 지금 숫자 읽기**")
 
         f_weeks_count = f["주시작일"].nunique()
-        g_baseline = g[(g["주시작일"] >= baseline_dates[0]) & (g["주시작일"] <= baseline_dates[1])]
+        g_baseline = g[(g["주시작일"] >= baseline_dates[0]) & (g["주시작일"] <= baseline_dates[1])] if baseline_dates[0] is not None else g
 
         if f_weeks_count < 4:
             st.markdown("- 주문 전환율(방문 → 주문): 비교하려면 선택 기간을 4주 이상 골라 주세요")
@@ -312,12 +343,8 @@ with tab_overview:
 
     st.divider()
 
-    # ------------------------------------------------------------
-    # 3. 차트
-    # ------------------------------------------------------------
     left, right = st.columns(2)
 
-    # 3-1. 주별 결제 전환율 (플랫폼별)
     wp = f.groupby(["주시작일", "플랫폼"])[["결제시작세션", "주문세션"]].sum().reset_index()
     wp["결제전환율"] = (wp["주문세션"] / wp["결제시작세션"] * 100).round(1)
     fig1 = px.line(
@@ -328,7 +355,6 @@ with tab_overview:
     fig1.update_layout(yaxis_title="결제 전환율 (%)", xaxis_title="주시작일")
     left.plotly_chart(fig1, width="stretch")
 
-    # 3-2. 세션 퍼널
     steps = {"1.방문": "세션수", "2.식당조회": "조회세션", "3.장바구니": "장바구니세션",
              "4.결제시작": "결제시작세션", "5.주문완료": "주문세션"}
     fun = pd.DataFrame({"단계": list(steps), "세션수": [f[c].sum() for c in steps.values()]})
@@ -340,7 +366,6 @@ with tab_overview:
     fig2.update_layout(xaxis_title="세션 수(개)", yaxis_title="퍼널 단계")
     right.plotly_chart(fig2, width="stretch")
 
-    # 3-3. 유입 경로별 주문 전환율
     ws = f.groupby("유입경로")[["세션수", "주문세션"]].sum().reset_index()
     ws["주문전환율"] = (ws["주문세션"] / ws["세션수"] * 100).round(1)
     ws = ws.sort_values("주문전환율")
@@ -357,9 +382,6 @@ with tab_overview:
 with tab_explore:
     st.caption("이 탭에서 볼 수 있는 것: 집단 비교(누적 전환율 퍼널, 단계 전환율 막대), 드릴다운 분석, 집단별 AI 해설")
 
-    # ------------------------------------------------------------
-    # 4. 집단 비교 영역
-    # ------------------------------------------------------------
     st.subheader("집단 비교")
     group_col_label = st.radio("비교 기준", ["플랫폼", "유입경로"], horizontal=True)
     group_col = "플랫폼" if group_col_label == "플랫폼" else "유입경로"
@@ -462,9 +484,6 @@ with tab_explore:
 
     st.divider()
 
-    # ------------------------------------------------------------
-    # 5. 드릴다운: 언제부터, 무엇 때문일까 영역
-    # ------------------------------------------------------------
     st.subheader("드릴다운: 언제부터, 무엇 때문일까")
 
     f_for_drill = f.copy()
@@ -547,5 +566,52 @@ with tab_explore:
         st.info("조건에 부합하는 집단이 없습니다.")
 
 with tab_action:
-    st.caption("이 탭에서 볼 수 있는 것: 액션 및 개선 제안 카드 (다음 단계에서 추가 예정)")
-    st.caption("액션 카드는 다음 단계에서 추가합니다.")
+    st.caption("측정 KPI의 현재 값은 선택한 기간의 마지막 4주로 계산합니다")
+
+    dates_all = sorted(df["주시작일"].unique()) if not df.empty else []
+    f_period = df[(df["주시작일"] >= selected_dates[0]) & (df["주시작일"] <= selected_dates[1])] if not df.empty and selected_dates[0] is not None else df
+    f_period_weeks = sorted(f_period["주시작일"].unique()) if not f_period.empty else []
+    last_4weeks_dates = f_period_weeks[-4:] if len(f_period_weeks) >= 4 else f_period_weeks
+    f_action_recent = f_period[f_period["주시작일"].isin(last_4weeks_dates)] if not f_period.empty else f_period
+
+    f_card1 = f_action_recent[f_action_recent["플랫폼"] == "Android"] if not f_action_recent.empty else f_action_recent
+    t_card1 = f_card1[["결제시작세션", "주문세션"]].sum() if not f_card1.empty else pd.Series({"결제시작세션": 0, "주문세션": 0})
+    def rate(a, b):
+        return a / b * 100 if b else 0
+    val_card1 = rate(t_card1["주문세션"], t_card1["결제시작세션"]) if t_card1["결제시작세션"] > 0 else None
+
+    f_card2 = f_action_recent[f_action_recent["유입경로"] == "push"] if not f_action_recent.empty else f_action_recent
+    t_card2 = f_card2[["세션수", "조회세션"]].sum() if not f_card2.empty else pd.Series({"세션수": 0, "조회세션": 0})
+    val_card2 = rate(t_card2["조회세션"], t_card2["세션수"]) if t_card2["세션수"] > 0 else None
+
+    col_action1, col_action2 = st.columns(2)
+
+    with col_action1:
+        with st.container(border=True):
+            st.markdown("**문제**\nAndroid 플랫폼에서 2026년 4월 하순부터 결제 전환율이 평소 대비 30%p 이상 급락하는 현상이 발생했습니다.")
+            st.markdown("**근거**\nAndroid 주별 결제 전환율이 70~80%대에서 41~56%대로 하락했고, 같은 기간 결제 실패 이벤트 수가 주당 100건 이상으로 급증했습니다.")
+            st.markdown("**성격**\n시스템 오류 / 기술적 장애")
+            st.markdown("**액션**\nAndroid 결제 API 연동 상태 및 PG사 모듈 오류 여부를 즉시 점검하고 긴급 패치를 배포합니다.")
+            st.markdown("**우선순위**\n1순위 (긴급)")
+
+            st.html("<div style='margin-top: 15px;'></div>")
+            if val_card1 is not None and not f_card1.empty:
+                st.metric("Android 결제 전환율 (결제 시작 → 주문)", f"{val_card1:.1f}%")
+            else:
+                st.metric("Android 결제 전환율 (결제 시작 → 주문)", "데이터 없음")
+            st.caption("대시보드에서: 주별 결제 전환율 (플랫폼별) 차트 및 0번 드릴다운 결제 실패 건수")
+
+    with col_action2:
+        with st.container(border=True):
+            st.markdown("**문제**\npush 유입 경로의 방문에서 식당 조회로 이어지는 초기 전환율이 28.4%로 다른 경로에 비해 매우 저조합니다.")
+            st.markdown("**근거**\npush 유입의 전체 세션은 4,635개이나 조회세션은 1,315개에 그쳐 첫 단계 이탈률이 높고 주문 전환율도 3.2%에 불과합니다.")
+            st.markdown("**성격**\n마케팅 타겟팅 / 콘텐츠 최적화")
+            st.markdown("**액션**\n푸시 메시지 문구와 링크된 랜딩 페이지(식당 상세 화면)의 연관성을 검토하고 타겟 고객군을 재설정합니다.")
+            st.markdown("**우선순위**\n2순위 (개선)")
+
+            st.html("<div style='margin-top: 15px;'></div>")
+            if val_card2 is not None and not f_card2.empty:
+                st.metric("Push 방문 → 식당 조회 전환율", f"{val_card2:.1f}%")
+            else:
+                st.metric("Push 방문 → 식당 조회 전환율", "데이터 없음")
+            st.caption("대시보드에서: 1번 집단 비교 퍼널 및 유입 경로별 주문 전환율 차트")
